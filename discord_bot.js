@@ -29,7 +29,7 @@ import {
 
 import * as engine from './music_engine.js';
 import { checkCooldown, startCooldown } from './cooldown.js';
-import { getWelcomeConfig, setWelcomeConfig } from './welcome_store.js';
+import { getWelcomeConfig, setWelcomeConfig, clearWelcomeConfig } from './welcome_store.js';
 import {
   ABOUT_TEXT,
   GITHUB_URL,
@@ -58,6 +58,14 @@ const commands = [
   new SlashCommandBuilder()
     .setName('setwelcome')
     .setDescription('Set up a welcome message for new members (admin only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('removewelcome')
+    .setDescription('Remove the welcome message for this server (admin only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('testwelcome')
+    .setDescription('Preview the welcome message in this channel (admin only)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map((c) => c.toJSON());
 
@@ -252,59 +260,74 @@ export function buildDiscordClient() {
   });
 
   client.on(Events.MessageCreate, async (message) => {
-    if (message.author.bot || !message.guild) return;
+    try {
+      if (message.author.bot || !message.guild) return;
 
-    const key = welcomeSessionKey(message.guild.id, message.author.id);
-    const session = welcomeSetupSessions.get(key);
-    if (!session) return;
+      const key = welcomeSessionKey(message.guild.id, message.author.id);
+      const session = welcomeSetupSessions.get(key);
+      if (!session) return;
 
-    if (Date.now() - session.startedAt > WELCOME_SETUP_TIMEOUT_MS) {
-      welcomeSetupSessions.delete(key);
-      await message.reply('⌛ Welcome setup timed out. Run /setwelcome again.');
-      return;
-    }
-
-    if (message.channelId !== session.channelId) return;
-
-    if (session.step === 'awaiting_image') {
-      const attachment = message.attachments.find((a) =>
-        /\.(png|gif|mp4|jpg|jpeg|webp)$/i.test(a.name || a.url)
+      console.log(
+        `[setwelcome] message from ${message.author.tag} in step "${session.step}", attachments: ${message.attachments.size}`
       );
-      if (!attachment) {
-        await message.reply('❌ Please upload a PNG, GIF, JPG, or MP4 attachment.');
+
+      if (Date.now() - session.startedAt > WELCOME_SETUP_TIMEOUT_MS) {
+        welcomeSetupSessions.delete(key);
+        await message.reply('⌛ Welcome setup timed out. Run /setwelcome again.');
         return;
       }
 
-      session.imageUrl = attachment.url;
-      session.step = 'awaiting_message';
-      session.startedAt = Date.now();
-      await message.reply(
-        '✅ Got the image. Now send the welcome message text.\n' +
-          'You can use `{user}`, `{server}`, and `{membercount}` as placeholders.'
-      );
-      return;
-    }
+      if (message.channelId !== session.channelId) return;
 
-    if (session.step === 'awaiting_message') {
-      session.messageTemplate = message.content;
-      session.step = 'awaiting_confirm';
+      if (session.step === 'awaiting_image') {
+        const attachment = message.attachments.find((a) => {
+          if (a.contentType && /^(image|video)\//.test(a.contentType)) return true;
+          const nameOrUrl = (a.name || a.url || '').split('?')[0];
+          return /\.(png|gif|mp4|jpg|jpeg|webp)$/i.test(nameOrUrl);
+        });
+        if (!attachment) {
+          await message.reply('❌ Please upload a PNG, GIF, JPG, or MP4 attachment.');
+          return;
+        }
 
-      const previewText = session.messageTemplate
-        .replaceAll('{user}', message.author.toString())
-        .replaceAll('{server}', message.guild.name)
-        .replaceAll('{membercount}', String(message.guild.memberCount));
+        session.imageUrl = attachment.url;
+        session.step = 'awaiting_message';
+        session.startedAt = Date.now();
+        await message.reply(
+          '✅ Got the image. Now send the welcome message text.\n' +
+            'You can use `{user}`, `{server}`, and `{membercount}` as placeholders.'
+        );
+        return;
+      }
 
-      const confirmRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`welcome_confirm_${message.author.id}`).setLabel('✅ Confirm').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`welcome_cancel_${message.author.id}`).setLabel('❌ Cancel').setStyle(ButtonStyle.Danger)
-      );
+      if (session.step === 'awaiting_message') {
+        session.messageTemplate = message.content;
+        session.step = 'awaiting_confirm';
 
-      await message.reply({
-        content: `**Preview:**\n${previewText}`,
-        files: [session.imageUrl],
-        components: [confirmRow],
-      });
-      return;
+        const previewText = session.messageTemplate
+          .replaceAll('{user}', message.author.toString())
+          .replaceAll('{server}', message.guild.name)
+          .replaceAll('{membercount}', String(message.guild.memberCount));
+
+        const confirmRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`welcome_confirm_${message.author.id}`).setLabel('✅ Confirm').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`welcome_cancel_${message.author.id}`).setLabel('❌ Cancel').setStyle(ButtonStyle.Danger)
+        );
+
+        await message.reply({
+          content: `**Preview:**\n${previewText}`,
+          files: [session.imageUrl],
+          components: [confirmRow],
+        });
+        return;
+      }
+    } catch (err) {
+      console.error('messageCreate (/setwelcome flow) error:', err);
+      try {
+        await message.reply('❌ Something went wrong during welcome setup. Run /setwelcome again.');
+      } catch {
+        // ignore secondary failure
+      }
     }
   });
 
@@ -410,6 +433,43 @@ export function buildDiscordClient() {
             content:
               '🖼️ Send the welcome image/GIF now (upload a PNG, GIF, or MP4 as an attachment in this channel).\n' +
               'You have 5 minutes.',
+          });
+          return;
+        }
+
+        if (interaction.commandName === 'removewelcome') {
+          if (!interaction.guild) {
+            await interaction.reply({ content: '❌ This command only works in a server.', ephemeral: true });
+            return;
+          }
+
+          const existing = getWelcomeConfig(interaction.guild.id);
+          if (!existing) {
+            await interaction.reply({ content: 'ℹ️ No welcome message is set up for this server.', ephemeral: true });
+            return;
+          }
+
+          clearWelcomeConfig(interaction.guild.id);
+          await interaction.reply({ content: '🗑️ Welcome message removed. New members will no longer get a welcome message.' });
+          return;
+        }
+
+        if (interaction.commandName === 'testwelcome') {
+          if (!interaction.guild) {
+            await interaction.reply({ content: '❌ This command only works in a server.', ephemeral: true });
+            return;
+          }
+
+          const config = getWelcomeConfig(interaction.guild.id);
+          if (!config) {
+            await interaction.reply({ content: '❌ No welcome message is set up yet. Run /setwelcome first.', ephemeral: true });
+            return;
+          }
+
+          const text = fillWelcomeTemplate(config.messageTemplate, interaction.member);
+          await interaction.reply({
+            content: `🧪 **Test preview** (this is what new members will see):\n\n${text}`,
+            files: config.imageUrl ? [config.imageUrl] : [],
           });
           return;
         }

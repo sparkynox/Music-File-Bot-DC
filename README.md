@@ -125,6 +125,15 @@ welcome message for new members:
    again. Restarts alone (the process crashing and coming back up) are
    fine — it's a fresh deploy/rebuild that can wipe it depending on the host.
 
+**`/removewelcome`** (admin only) — deletes the saved welcome config for
+this server. New members stop getting a welcome message until
+`/setwelcome` is run again.
+
+**`/testwelcome`** (admin only) — sends the current welcome message in
+the channel you run it in, using your own account in place of the new
+member, so you can check how it looks without waiting for someone to
+join. Errors if nothing is configured yet.
+
 **Discord Developer Portal setup required:** this feature needs the
 **Server Members Intent** and **Message Content Intent** turned on for
 your bot. Go to your application at https://discord.com/developers/applications
