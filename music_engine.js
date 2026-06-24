@@ -86,6 +86,12 @@ function runYtDlp(ytDlpPath, args, { captureStdout = false } = {}) {
               "YouTube is blocking this download (bot-check). The bot owner needs to set up cookies — check YTDLP_COOKIES_FILE in .env."
             )
           );
+        } else if (stderr.includes('Requested format is not available')) {
+          reject(
+            new DownloadError(
+              "That resolution isn't available for this video. Try a different resolution or a different video."
+            )
+          );
         } else {
           reject(new DownloadError(`Couldn't find or download that: ${stderr.trim().slice(-500)}`));
         }
@@ -94,6 +100,99 @@ function runYtDlp(ytDlpPath, args, { captureStdout = false } = {}) {
       resolve(stdout);
     });
   });
+}
+
+/**
+ * Free resolutions that are actually allowed to download.
+ * Anything else (480p, 720p, 1080p) is gated behind the Premium message.
+ */
+export const FREE_VIDEO_RESOLUTIONS = ['144p', '240p', '360p'];
+export const PREMIUM_VIDEO_RESOLUTIONS = ['480p', '720p', '1080p'];
+
+async function resolveTitle(ytDlpPath, target, cookiesFile) {
+  try {
+    const titleArgs = [target, '--no-playlist', '--quiet', '--no-warnings', '--print', 'title'];
+    if (cookiesFile && fs.existsSync(cookiesFile)) titleArgs.push('--cookies', cookiesFile);
+    const out = await runYtDlp(ytDlpPath, titleArgs, { captureStdout: true });
+    const firstLine = out.trim().split('\n')[0];
+    return firstLine || null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveThumbnail(ytDlpPath, target, cookiesFile) {
+  try {
+    const args = [target, '--no-playlist', '--quiet', '--no-warnings', '--print', 'thumbnail'];
+    if (cookiesFile && fs.existsSync(cookiesFile)) args.push('--cookies', cookiesFile);
+    const out = await runYtDlp(ytDlpPath, args, { captureStdout: true });
+    const firstLine = out.trim().split('\n')[0];
+    return firstLine || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Looks up just the title + thumbnail for `query` without downloading
+ * anything. Used to show a preview before MP3/Video buttons.
+ */
+export async function getPreview(query) {
+  const ytDlpPath = await ensureYtDlp();
+  const cookiesFile = process.env.YTDLP_COOKIES_FILE;
+  const target = isUrl(query) ? query.trim() : `ytsearch1:${query.trim()}`;
+
+  const title = await resolveTitle(ytDlpPath, target, cookiesFile);
+  const thumbnailUrl = await resolveThumbnail(ytDlpPath, target, cookiesFile);
+
+  if (!title) {
+    throw new DownloadError(`Couldn't find anything for "${query}".`);
+  }
+
+  return { title, thumbnailUrl, url: isUrl(query) ? query.trim() : null };
+}
+
+/**
+ * Search YouTube for `query` and return up to `count` results, each
+ * with { title, url, thumbnailUrl, durationSeconds, uploader }.
+ * Used by /search for the multi-result picker.
+ */
+export async function searchVideos(query, count = 15) {
+  const ytDlpPath = await ensureYtDlp();
+  const cookiesFile = process.env.YTDLP_COOKIES_FILE;
+
+  const args = [
+    `ytsearch${count}:${query.trim()}`,
+    '--flat-playlist',
+    '--quiet',
+    '--no-warnings',
+    '--dump-json',
+    '--extractor-args',
+    'youtube:player_client=android,web',
+  ];
+  if (cookiesFile && fs.existsSync(cookiesFile)) {
+    args.push('--cookies', cookiesFile);
+  }
+
+  const out = await runYtDlp(ytDlpPath, args, { captureStdout: true });
+  const lines = out.trim().split('\n').filter(Boolean);
+
+  return lines
+    .map((line) => {
+      try {
+        const obj = JSON.parse(line);
+        return {
+          title: obj.title || 'Unknown title',
+          url: obj.url || (obj.id ? `https://www.youtube.com/watch?v=${obj.id}` : null),
+          thumbnailUrl: obj.thumbnails?.length ? obj.thumbnails[obj.thumbnails.length - 1].url : obj.thumbnail || null,
+          durationSeconds: obj.duration ?? null,
+          uploader: obj.uploader || obj.channel || 'Unknown',
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter((r) => r && r.url);
 }
 
 /**
@@ -150,17 +249,72 @@ export async function downloadAudio(query, fmt) {
   const finalPath = path.join(DOWNLOAD_DIR, produced[0]);
   const stat = fs.statSync(finalPath);
   const ext = path.extname(finalPath).replace('.', '');
+  const title = (await resolveTitle(ytDlpPath, target, cookiesFile)) ?? path.basename(finalPath, path.extname(finalPath));
 
-  let title = path.basename(finalPath, path.extname(finalPath));
-  try {
-    const titleArgs = [target, '--no-playlist', '--quiet', '--no-warnings', '--print', 'title'];
-    if (cookiesFile && fs.existsSync(cookiesFile)) titleArgs.push('--cookies', cookiesFile);
-    const out = await runYtDlp(ytDlpPath, titleArgs, { captureStdout: true });
-    const firstLine = out.trim().split('\n')[0];
-    if (firstLine) title = firstLine;
-  } catch {
-    // fall back to filename-derived title, already set above
+  return { path: finalPath, title, sizeBytes: stat.size, ext };
+}
+
+/**
+ * Download `query` as video at one of the FREE_VIDEO_RESOLUTIONS
+ * ('144p', '240p', or '360p'). Premium resolutions are intentionally
+ * not handled here — the bot layer should intercept those before
+ * ever calling this function.
+ *
+ * Returns { path, title, sizeBytes, ext }. Caller must delete the
+ * returned path after use (see safeDelete).
+ */
+export async function downloadVideo(query, resolution) {
+  if (!FREE_VIDEO_RESOLUTIONS.includes(resolution)) {
+    throw new DownloadError(`Resolution ${resolution} is not available for free download.`);
   }
+
+  const ytDlpPath = await ensureYtDlp();
+  const ffmpegPath = await ensureFfmpeg();
+
+  const jobId = randomUUID();
+  const outTemplate = path.join(DOWNLOAD_DIR, `${jobId}.%(ext)s`);
+  const target = isUrl(query) ? query.trim() : `ytsearch1:${query.trim()}`;
+  const cookiesFile = process.env.YTDLP_COOKIES_FILE;
+  const heightCap = parseInt(resolution.replace('p', ''), 10);
+
+  const args = [
+    target,
+    '--no-playlist',
+    '--quiet',
+    '--no-warnings',
+    '-o',
+    outTemplate,
+    '--extractor-args',
+    'youtube:player_client=android,web',
+    '-f',
+    // Try split video+audio at the cap first, then a pre-merged format
+    // at the cap, then the worst available combined format — but only
+    // ever the actual cap, never above it. If literally no format at
+    // or below the cap exists, yt-dlp will report a clean "format not
+    // available" error instead of silently exceeding the free tier.
+    `bestvideo[height<=${heightCap}]+bestaudio/best[height<=${heightCap}]/worst[height<=${heightCap}]`,
+    '--merge-output-format',
+    'mp4',
+  ];
+
+  if (ffmpegPath !== 'ffmpeg') {
+    args.push('--ffmpeg-location', ffmpegPath);
+  }
+  if (cookiesFile && fs.existsSync(cookiesFile)) {
+    args.push('--cookies', cookiesFile);
+  }
+
+  await runYtDlp(ytDlpPath, args);
+
+  const produced = fs.readdirSync(DOWNLOAD_DIR).filter((f) => f.startsWith(jobId));
+  if (produced.length === 0) {
+    throw new DownloadError('Download finished but the file went missing. Try again.');
+  }
+
+  const finalPath = path.join(DOWNLOAD_DIR, produced[0]);
+  const stat = fs.statSync(finalPath);
+  const ext = path.extname(finalPath).replace('.', '');
+  const title = (await resolveTitle(ytDlpPath, target, cookiesFile)) ?? path.basename(finalPath, path.extname(finalPath));
 
   return { path: finalPath, title, sizeBytes: stat.size, ext };
 }

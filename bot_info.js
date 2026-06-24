@@ -24,3 +24,8 @@ export const HOSTING_NOTICE_TEXT =
   '⚠️ **Heads up:** this bot runs on a small 700MB hosting plan, so it ' +
   "may occasionally go offline. If that happens, or if you'd like to run " +
   'your own copy, you can clone it from the source code below.';
+
+export const PREMIUM_FEATURE_TEXT =
+  "💎 You've tried to use a **Premium** feature. " +
+  'Higher resolutions (480p, 720p, 1080p) are reserved for Premium users. ' +
+  'Contact on Instagram to get access.';
